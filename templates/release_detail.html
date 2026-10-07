@@ -11,16 +11,18 @@
   <div class="toolbar">
     <a class="btn ghost" href="{{ url_for('release_export_csv', version=rel.version) }}">⬇ 导出本版 CSV</a>
     <a class="btn ghost" href="{{ url_for('release_export_json', version=rel.version) }}">⬇ 导出本版 JSON</a>
+    <a class="btn ghost" href="{{ url_for('executions_page') }}">🏭 生产执行</a>
     <a class="btn ghost" href="{{ url_for('releases') }}">全部版本</a>
     <a class="btn ghost" href="{{ url_for('index') }}">返回看板</a>
   </div>
   <table>
     <thead>
       <tr><th>#</th><th>批次 / 过敏原</th><th>器具</th><th>预计时段</th>
-        <th>状态</th><th>风险来源与所用清洁</th></tr>
+        <th>状态</th><th>执行状态</th><th>风险来源与所用清洁</th></tr>
     </thead>
     <tbody>
     {% for it in items %}
+      {% set ex = exec_map.get(it.batch_id) %}
       <tr>
         <td>{{ it.position }}</td>
         <td>
@@ -37,6 +39,22 @@
         <td>
           {% if it.status == 'accepted' %}<span class="badge ok">已排入</span>
           {% else %}<span class="badge bad">已拒绝</span>{% endif %}
+        </td>
+        <td>
+          {% if ex %}
+            {% if ex.actual_end %}
+            <a href="{{ url_for('executions_page') }}"><span class="badge ok">已完工</span></a>
+            {% else %}
+            <a href="{{ url_for('executions_page') }}"><span class="badge run">进行中</span></a>
+            {% endif %}
+            <div class="muted time" style="margin-top:4px;">
+              据 v{{ ex.release_version }}<br>
+              开工 {{ ex.actual_start.replace('T', ' ') }}
+              {% if ex.actual_end %}<br>完工 {{ ex.actual_end.replace('T', ' ') }}{% endif %}
+            </div>
+          {% else %}
+          <span class="muted">未开工</span>
+          {% endif %}
         </td>
         <td class="risks">
           {% if it.risks %}

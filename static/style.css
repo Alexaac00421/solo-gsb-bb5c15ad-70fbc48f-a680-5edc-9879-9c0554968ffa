@@ -216,3 +216,18 @@ tr.cancelled-row td > * { opacity: .8; }
 .remedy-table tr.bad-row td { background: var(--bad-bg); }
 .remedy-window { margin-top: 6px; font-size: 13.5px; color: var(--ok); }
 tr.target-row td { outline: 2px solid var(--warn); outline-offset: -2px; }
+
+/* 生产执行 */
+.badge.run { background: #e0f2fe; color: #0369a1; }
+.card.run-card .num { color: #0369a1; }
+.exec-ops { white-space: nowrap; }
+.start-form { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+.start-form label { display: flex; flex-direction: column; gap: 3px; font-size: 12.5px; color: var(--muted); }
+.start-form input[type="datetime-local"] {
+  padding: 5px 6px; border: 1px solid var(--line); border-radius: 6px; font-size: 13px;
+}
+.inline-complete { flex-direction: row; align-items: center; gap: 6px; }
+tr.row-running td { background: #f0f9ff; }
+tr.row-done td { background: #f6fef8; }
+tr.row-bad td { background: #fff7f7; }
+.exec-start-table .reasons { max-width: 360px; }

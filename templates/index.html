@@ -4,6 +4,7 @@
 <section class="cards">
   <div class="card ok"><div class="num">{{ accepted }}</div><div>已排入批次</div></div>
   <div class="card bad"><div class="num">{{ blocked_count }}</div><div>被阻塞批次</div></div>
+  <div class="card run-card"><div class="num">{{ running_count }}</div><div>进行中（已开工未完工）</div></div>
   <div class="card"><div class="num">{{ results|length }}</div><div>待排批次总数</div></div>
 </section>
 
@@ -17,6 +18,7 @@
   </form>
   <a class="btn ghost" href="{{ url_for('reschedule_page') }}">🧪 批量调整试算</a>
   <a class="btn ghost" href="{{ url_for('cleaning_remedy_page') }}">🧯 清洁补救试算</a>
+  <a class="btn ghost" href="{{ url_for('executions_page') }}">🏭 生产执行（开工 / 完工）</a>
   <a class="btn ghost" href="{{ url_for('export_csv') }}">⬇ 导出 CSV</a>
   <a class="btn ghost" href="{{ url_for('export_json') }}">⬇ 导出 JSON</a>
   <a class="btn ghost" href="{{ url_for('export_cleaning_deletions_csv') }}">🧾 删除记录 CSV</a>
@@ -61,7 +63,7 @@
   <thead>
     <tr>
       <th>#</th><th>批次 / 过敏原</th><th>器具</th><th>预计时段</th>
-      <th>状态</th><th>风险来源与处置</th><th>对比交接版</th><th>顺序</th>
+      <th>状态</th><th>执行状态</th><th>风险来源与处置</th><th>对比交接版</th><th>顺序</th>
     </tr>
   </thead>
   <tbody>
@@ -82,6 +84,13 @@
       <td>
         {% if r.status == 'accepted' %}<span class="badge ok">已排入</span>
         {% else %}<span class="badge bad">已拒绝</span>{% endif %}
+      </td>
+      <td>
+        {% if exec_status.get(r.id) == 'running' %}
+        <a href="{{ url_for('executions_page') }}"><span class="badge run">进行中</span></a>
+        {% elif exec_status.get(r.id) == 'completed' %}
+        <a href="{{ url_for('executions_page') }}"><span class="badge ok">已完工</span></a>
+        {% else %}<span class="muted">—</span>{% endif %}
       </td>
       <td class="risks">
         {% if r.status == 'blocked' %}

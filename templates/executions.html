@@ -1,0 +1,183 @@
+{% extends "base.html" %}
+{% block title %}生产执行 · 共享厨房过敏原排程{% endblock %}
+{% block content %}
+<section class="panel">
+  <h2>生产现场执行（按交接版逐批开工）</h2>
+  <p class="hint">
+    操作员只能选择<strong>最新交接版</strong>中的批次开工，并填写实际开工时间。
+    仅当批次仍存在、实时排程<strong>已排入</strong>，且顺序、计划时段、器具、过敏原、
+    风险来源与所用清洁均与该版快照<strong>完全一致</strong>时才可开工；否则逐项列出差异且不记开工。
+    同一批次不得重复开工；进行中批次可填写实际完工时间（早于开工或重复完工均拒绝）。
+    进行中批次的排程依据会被锁定：批次 / 器具 / 清洁 / 停用 / 批量调整等写入若会改变其计算结果，
+    整次拒绝并指出批次；不影响它的操作照常保存。批次日后被删除或改排，下方执行记录仍可查看。
+  </p>
+  <div class="toolbar">
+    <a class="btn ghost" href="{{ url_for('index') }}">返回排程看板</a>
+    <a class="btn ghost" href="{{ url_for('releases') }}">交接版列表</a>
+    {% if latest %}
+    <a class="btn ghost" href="{{ url_for('release_detail', version=latest.version) }}">查看最新交接版 v{{ latest.version }}</a>
+    {% endif %}
+  </div>
+</section>
+
+<section class="panel">
+  <h2>最新交接版{% if latest %} · v{{ latest.version }}{% endif %} · 开工核对</h2>
+  {% if not latest %}
+  <p class="empty">尚无交接版。请先在 <a href="{{ url_for('index') }}">排程看板</a>
+    发布交接版（全部批次可排入时才可发布），发布后现场才能按版开工。</p>
+  {% else %}
+  <p class="hint">
+    发布于 {{ latest.created_at.replace('T', ' ') }} · 共 {{ latest.batch_count }} 个批次。
+    每页开工会在服务端写事务内重新核对，防止并发修改穿透。
+  </p>
+  <table class="exec-start-table">
+    <thead>
+      <tr>
+        <th>#</th><th>批次 / 过敏原</th><th>器具</th><th>计划时段</th>
+        <th>执行状态</th><th>开工核对（实时排程 vs 交接版快照）</th><th>开工 / 完工</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for e in entries %}
+      {% set it = e.item %}
+      <tr class="{{ 'row-running' if e.state == 'running' else 'row-done' if e.state == 'completed' else 'row-bad' if e.state in ['missing', 'mismatch'] }}">
+        <td>{{ it.position }}</td>
+        <td>
+          <strong>{{ it.batch_name }}</strong><br>
+          <span class="tags">
+            {% for a in it.allergens.split('、') if a %}<span class="tag">{{ a }}</span>
+            {% else %}<span class="tag none">无过敏原</span>{% endfor %}
+          </span>
+        </td>
+        <td>{{ it.equipment_names or '—' }}</td>
+        <td class="time">{{ it.planned_start.replace('T', ' ') }} ~ {{ it.planned_end.replace('T', ' ') }}</td>
+        <td>
+          {% if e.state == 'running' %}
+          <span class="badge run">进行中</span><br>
+          <span class="muted time">开工 {{ e.exec.actual_start.replace('T', ' ') }}</span>
+          {% elif e.state == 'completed' %}
+          <span class="badge ok">已完工</span><br>
+          <span class="muted time">开工 {{ e.exec.actual_start.replace('T', ' ') }}<br>
+            完工 {{ e.exec.actual_end.replace('T', ' ') }}</span>
+          {% elif e.state == 'missing' %}
+          <span class="badge bad">批次已删除</span>
+          {% elif e.state == 'mismatch' %}
+          <span class="badge warn">不可开工</span>
+          {% else %}
+          <span class="badge muted">待开工</span>
+          {% endif %}
+        </td>
+        <td class="risks">
+          {% if e.state == 'running' or e.state == 'completed' %}
+          <span class="muted">已据交接版 v{{ e.exec.release_version }} 记开工，依据快照随执行记录保存。</span>
+          {% elif e.state == 'missing' %}
+          <ul class="reasons"><li class="block">⛔ {{ e.mismatches|join('；') }}</li></ul>
+          {% elif e.state == 'mismatch' %}
+          <ul class="reasons">
+            {% for m in e.mismatches %}<li class="block">⛔ {{ m }}</li>{% endfor %}
+          </ul>
+          {% else %}
+          <span class="badge ok">与快照一致，可开工</span>
+          {% if it.risks %}
+          <ul class="reasons" style="margin-top:6px;">
+            {% for risk in it.risks %}
+            <li class="{{ risk.level }}">
+              {{ risk_source_text(risk) }}<br>
+              <span class="action">
+                {% if risk.level == 'none' %}✅{% elif risk.level == 'mitigated' %}🧼{% else %}⚠️{% endif %}
+                {{ risk_action_text(risk) }}
+              </span>
+            </li>
+            {% endfor %}
+          </ul>
+          {% endif %}
+          {% endif %}
+        </td>
+        <td class="exec-ops">
+          {% if e.state == 'startable' %}
+          <form method="post" action="{{ url_for('execution_start') }}" class="start-form">
+            <input type="hidden" name="batch_id" value="{{ it.batch_id }}">
+            <label>实际开工时间
+              <input type="datetime-local" name="actual_start" required class="start-time">
+            </label>
+            <button class="btn small" type="submit">▶ 记开工</button>
+          </form>
+          {% elif e.state == 'running' %}
+          <form method="post" action="{{ url_for('execution_complete', eid=e.exec.id) }}" class="start-form">
+            <label>实际完工时间
+              <input type="datetime-local" name="actual_end" required class="complete-time">
+            </label>
+            <button class="btn small" type="submit">⏹ 记完工</button>
+          </form>
+          {% else %}
+          <span class="muted">—</span>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <h2>执行记录（含已删除 / 已改排批次）</h2>
+  <p class="hint">执行记录保存所据交接版与实际开 / 完工时间；批次之后被删除或改排不影响本记录。</p>
+  {% if not executions %}
+  <p class="empty">暂无开工记录。</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr>
+        <th>#</th><th>批次</th><th>所据交接版</th><th>实际开工</th><th>实际完工</th>
+        <th>状态</th><th>记录时间</th><th>完工操作</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for ex in executions %}
+      <tr class="{{ 'row-running' if not ex.actual_end }}">
+        <td>{{ ex.id }}</td>
+        <td><strong>{{ ex.batch_name }}</strong>
+          <span class="muted">（批次 #{{ ex.batch_id if ex.batch_id is not none else '已删除' }}）</span>
+        </td>
+        <td><a href="{{ url_for('release_detail', version=ex.release_version) }}">v{{ ex.release_version }}</a></td>
+        <td class="time">{{ ex.actual_start.replace('T', ' ') }}</td>
+        <td class="time">{{ ex.actual_end.replace('T', ' ') if ex.actual_end else '—' }}</td>
+        <td>
+          {% if ex.actual_end %}<span class="badge ok">已完工</span>
+          {% else %}<span class="badge run">进行中</span>{% endif %}
+        </td>
+        <td class="time muted">
+          开工登记 {{ ex.started_at.replace('T', ' ') }}
+          {% if ex.completed_at %}<br>完工登记 {{ ex.completed_at.replace('T', ' ') }}{% endif %}
+        </td>
+        <td>
+          {% if not ex.actual_end %}
+          <form method="post" action="{{ url_for('execution_complete', eid=ex.id) }}" class="start-form inline-complete">
+            <input type="datetime-local" name="actual_end" required class="complete-time">
+            <button class="btn small" type="submit">⏹ 记完工</button>
+          </form>
+          {% else %}<span class="muted">—</span>{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+
+<script>
+// 实际开 / 完工时间默认填入当前时间（操作者可按需修改）
+function fillNow(selector) {
+  document.querySelectorAll(selector).forEach(function (el) {
+    if (!el.value) {
+      var d = new Date();
+      d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
+      el.value = d.toISOString().slice(0, 16);
+    }
+  });
+}
+fillNow('input.start-time');
+fillNow('input.complete-time');
+</script>
+{% endblock %}

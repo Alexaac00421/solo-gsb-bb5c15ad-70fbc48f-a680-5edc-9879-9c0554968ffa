@@ -20,6 +20,7 @@
     <a href="{{ url_for('cleaning_remedy_page') }}" class="{{ 'active' if request.endpoint in ['cleaning_remedy_page', 'cleaning_remedy_preview'] }}">清洁补救试算</a>
     <a href="{{ url_for('equipment_page') }}" class="{{ 'active' if request.endpoint == 'equipment_page' }}">器具与清洁</a>
     <a href="{{ url_for('releases') }}" class="{{ 'active' if request.endpoint in ['releases', 'release_detail'] }}">交接版</a>
+    <a href="{{ url_for('execution_page') }}" class="{{ 'active' if request.endpoint in ['execution_page', 'start_execution', 'finish_execution'] }}">生产执行</a>
   </nav>
 </header>
 <main class="wrap">

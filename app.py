@@ -27,6 +27,15 @@
    清洁重算后目标仍阻塞，均判定不可仅靠清洁解决。试算只用虚拟清洁在内存中
    重算完整排程（含其他批次的级联变化），不写入清洁、实时排程或交接版；
    无效批次与非正整数时长一律拒绝。
+7. 生产执行：操作员按最新交接版逐批开工——只有批次仍存在、实时排程已排入，
+   且顺序、计划时段、器具、过敏原、风险来源与所用清洁均与该版快照一致时
+   才记录实际开工时间，否则说明差异且不记开工；同一批次不得重复开工
+   （execution.batch_id 唯一约束兜底）。进行中批次可登记实际完工时间，
+   早于开工或重复完工均拒绝；执行记录保存所据版本与开完工时间，批次日后
+   删除或改排仍可查看。进行中批次的排程依据必须保持不变：批次、器具、
+   清洁、停用与批量调整等写操作在事务内对比操作前后的计算结果，会改变
+   进行中批次依据的整次拒绝并指出批次；开工、完工与相关写入均在
+   BEGIN IMMEDIATE 写事务内判定，避免并发穿透。
 """
 import csv
 import hashlib
@@ -120,6 +129,22 @@ CREATE TABLE IF NOT EXISTS release_item (
     status TEXT NOT NULL DEFAULT 'accepted',
     risks TEXT NOT NULL DEFAULT '[]',
     revision_note TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS execution (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    release_id INTEGER NOT NULL REFERENCES release_version(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL,
+    batch_id INTEGER UNIQUE,
+    batch_name TEXT NOT NULL DEFAULT '',
+    position INTEGER NOT NULL DEFAULT 0,
+    allergens TEXT NOT NULL DEFAULT '',
+    equipment_names TEXT NOT NULL DEFAULT '',
+    planned_start TEXT NOT NULL DEFAULT '',
+    planned_end TEXT NOT NULL DEFAULT '',
+    actual_start TEXT NOT NULL,
+    actual_end TEXT,
+    started_at TEXT NOT NULL DEFAULT '',
+    finished_at TEXT
 );
 """
 
@@ -456,11 +481,11 @@ def latest_revisions(conn):
 
 
 def normalize_seq(conn):
+    """把批次顺序规范化为 1..N（不写事务，由调用方在事务内统一提交）。"""
     rows = conn.execute(
         "SELECT id FROM batch ORDER BY seq, planned_start, id").fetchall()
     for i, r in enumerate(rows, 1):
         conn.execute("UPDATE batch SET seq=? WHERE id=?", (i, r["id"]))
-    conn.commit()
 
 
 def cleaning_cover_text(covers):
@@ -600,6 +625,18 @@ def index():
     items = release_items(conn, latest["id"]) if latest else []
     diff, removed_ids = (diff_against_release(results, items)
                          if latest else ({}, set()))
+    executions = execution_by_batch(conn)
+    exec_stats = None
+    if latest:
+        exec_stats = {"done": 0, "doing": 0, "todo": 0}
+        for it in items:
+            ex = executions.get(it["batch_id"])
+            if ex is None:
+                exec_stats["todo"] += 1
+            elif ex["actual_end"]:
+                exec_stats["done"] += 1
+            else:
+                exec_stats["doing"] += 1
     return render_template("index.html", results=results,
                            accepted=accepted,
                            blocked_count=len(results) - accepted,
@@ -607,7 +644,8 @@ def index():
                                conn, include_cancelled=False),
                            cleaning_deletions=cleaning_deletion_rows(conn),
                            latest_release=latest, release_items=items,
-                           release_diff=diff, removed_ids=removed_ids)
+                           release_diff=diff, removed_ids=removed_ids,
+                           executions=executions, exec_stats=exec_stats)
 
 
 @app.post("/recalculate")
@@ -627,7 +665,14 @@ def batches():
         end = request.form.get("planned_end", "")
         if not name or not start or not end:
             flash("请填写批次名称与预计时段", "error")
-        else:
+            return redirect(url_for("batches"))
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError:
+            flash("系统正忙，请稍后重试录入批次", "error")
+            return redirect(url_for("batches"))
+        try:
+            before = inprogress_guard_snapshot(conn)
             seq = conn.execute(
                 "SELECT COALESCE(MAX(seq),0)+1 AS s FROM batch").fetchone()["s"]
             cur = conn.execute(
@@ -637,8 +682,16 @@ def batches():
             for eq in equipment:
                 conn.execute("INSERT INTO batch_equipment VALUES (?,?)",
                              (cur.lastrowid, int(eq)))
+            violated = inprogress_violations(conn, before)
+            if violated:
+                conn.rollback()
+                flash(guard_reject_text(violated, prefix="未录入"), "error")
+                return redirect(url_for("batches"))
             conn.commit()
-            flash(f"批次「{name}」已录入，当前排第 {seq} 位", "ok")
+        except Exception:
+            conn.rollback()
+            raise
+        flash(f"批次「{name}」已录入，当前排第 {seq} 位", "ok")
         return redirect(url_for("batches"))
     rows = conn.execute("SELECT * FROM batch ORDER BY seq").fetchall()
     eq_names = {r["id"]: r["name"]
@@ -663,21 +716,33 @@ def revise_allergens(bid):
     重新计算排程时自然使用最新集合。
     """
     conn = get_db()
-    row = conn.execute("SELECT * FROM batch WHERE id=?", (bid,)).fetchone()
-    if row is None:
-        flash("批次不存在或已删除", "error")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError:
+        flash("系统正忙，请稍后重试修改过敏原", "error")
         return redirect(url_for("batches"))
-    reason = request.form.get("reason", "").strip()
-    changed_at = request.form.get("changed_at", "").strip()
-    new_list = [a.strip() for a in request.form.getlist("allergens") if a.strip()]
-    old_set, new_set = split_allergens(row["allergens"]), set(new_list)
-    if not reason:
-        flash("未保存：修改过敏原必须填写变更原因", "error")
-    elif not changed_at or parse_dt(changed_at) is None:
-        flash("未保存：请填写有效的变更时间", "error")
-    elif new_set == old_set:
-        flash("未保存：过敏原集合无实际变化", "error")
-    else:
+    try:
+        row = conn.execute("SELECT * FROM batch WHERE id=?", (bid,)).fetchone()
+        if row is None:
+            conn.rollback()
+            flash("批次不存在或已删除", "error")
+            return redirect(url_for("batches"))
+        reason = request.form.get("reason", "").strip()
+        changed_at = request.form.get("changed_at", "").strip()
+        new_list = [a.strip() for a in request.form.getlist("allergens") if a.strip()]
+        old_set, new_set = split_allergens(row["allergens"]), set(new_list)
+        error = None
+        if not reason:
+            error = "未保存：修改过敏原必须填写变更原因"
+        elif not changed_at or parse_dt(changed_at) is None:
+            error = "未保存：请填写有效的变更时间"
+        elif new_set == old_set:
+            error = "未保存：过敏原集合无实际变化"
+        if error:
+            conn.rollback()
+            flash(error, "error")
+            return redirect(url_for("batches"))
+        before = inprogress_guard_snapshot(conn)
         new_str = ",".join(new_list)
         conn.execute("UPDATE batch SET allergens=? WHERE id=?", (new_str, bid))
         conn.execute(
@@ -685,19 +750,47 @@ def revise_allergens(bid):
             "(batch_id, old_allergens, new_allergens, reason, changed_at)"
             " VALUES (?,?,?,?,?)",
             (bid, row["allergens"], new_str, reason, changed_at))
+        violated = inprogress_violations(conn, before)
+        if violated:
+            conn.rollback()
+            flash(guard_reject_text(violated), "error")
+            return redirect(url_for("batches"))
         conn.commit()
-        flash(f"批次「{row['name']}」过敏原已更新"
-              f"（{join_alg(sorted(old_set))} → {join_alg(sorted(new_set))}），"
-              f"修订记录已保存，重新计算排程将使用最新集合", "ok")
+    except Exception:
+        conn.rollback()
+        raise
+    flash(f"批次「{row['name']}」过敏原已更新"
+          f"（{join_alg(sorted(old_set))} → {join_alg(sorted(new_set))}），"
+          f"修订记录已保存，重新计算排程将使用最新集合", "ok")
     return redirect(url_for("batches"))
 
 
 @app.post("/batches/<int:bid>/delete")
 def delete_batch(bid):
     conn = get_db()
-    conn.execute("DELETE FROM batch WHERE id=?", (bid,))
-    conn.commit()
-    normalize_seq(conn)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError:
+        flash("系统正忙，请稍后重试删除批次", "error")
+        return redirect(url_for("batches"))
+    try:
+        row = conn.execute("SELECT * FROM batch WHERE id=?", (bid,)).fetchone()
+        if row is None:
+            conn.rollback()
+            flash("批次不存在或已删除", "error")
+            return redirect(url_for("batches"))
+        before = inprogress_guard_snapshot(conn)
+        conn.execute("DELETE FROM batch WHERE id=?", (bid,))
+        normalize_seq(conn)
+        violated = inprogress_violations(conn, before)
+        if violated:
+            conn.rollback()
+            flash(guard_reject_text(violated, prefix="未删除"), "error")
+            return redirect(url_for("batches"))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     flash("批次已删除", "ok")
     return redirect(url_for("batches"))
 
@@ -705,18 +798,39 @@ def delete_batch(bid):
 @app.post("/batches/<int:bid>/move/<direction>")
 def move_batch(bid, direction):
     conn = get_db()
-    normalize_seq(conn)
-    rows = conn.execute("SELECT id, seq FROM batch ORDER BY seq").fetchall()
-    ids = [r["id"] for r in rows]
-    if bid in ids:
-        i = ids.index(bid)
-        j = i - 1 if direction == "up" else i + 1
-        if 0 <= j < len(ids):
-            a, b = rows[i], rows[j]
-            conn.execute("UPDATE batch SET seq=? WHERE id=?", (b["seq"], a["id"]))
-            conn.execute("UPDATE batch SET seq=? WHERE id=?", (a["seq"], b["id"]))
-            conn.commit()
-            flash("已调整顺序并重新计算排程", "ok")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError:
+        flash("系统正忙，请稍后重试调整顺序", "error")
+        return redirect(url_for("index"))
+    try:
+        before = inprogress_guard_snapshot(conn)
+        normalize_seq(conn)
+        rows = conn.execute("SELECT id, seq FROM batch ORDER BY seq").fetchall()
+        ids = [r["id"] for r in rows]
+        moved = False
+        if bid in ids:
+            i = ids.index(bid)
+            j = i - 1 if direction == "up" else i + 1
+            if 0 <= j < len(ids):
+                a, b = rows[i], rows[j]
+                conn.execute("UPDATE batch SET seq=? WHERE id=?",
+                             (b["seq"], a["id"]))
+                conn.execute("UPDATE batch SET seq=? WHERE id=?",
+                             (a["seq"], b["id"]))
+                moved = True
+        if moved:
+            violated = inprogress_violations(conn, before)
+            if violated:
+                conn.rollback()
+                flash(guard_reject_text(violated, prefix="未调整顺序"), "error")
+                return redirect(url_for("index"))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    if moved:
+        flash("已调整顺序并重新计算排程", "ok")
     return redirect(url_for("index"))
 
 
@@ -725,13 +839,31 @@ def equipment_page():
     conn = get_db()
     if request.method == "POST":
         name = request.form.get("name", "").strip()
-        if name:
+        if not name:
+            return redirect(url_for("equipment_page"))
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError:
+            flash("系统正忙，请稍后重试添加器具", "error")
+            return redirect(url_for("equipment_page"))
+        try:
+            before = inprogress_guard_snapshot(conn)
             try:
                 conn.execute("INSERT INTO equipment(name) VALUES (?)", (name,))
-                conn.commit()
-                flash(f"器具「{name}」已添加", "ok")
             except sqlite3.IntegrityError:
+                conn.rollback()
                 flash(f"器具「{name}」已存在", "error")
+                return redirect(url_for("equipment_page"))
+            violated = inprogress_violations(conn, before)
+            if violated:
+                conn.rollback()
+                flash(guard_reject_text(violated, prefix="未添加器具"), "error")
+                return redirect(url_for("equipment_page"))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        flash(f"器具「{name}」已添加", "ok")
         return redirect(url_for("equipment_page"))
     equipment = conn.execute("SELECT * FROM equipment ORDER BY id").fetchall()
     cleanings = conn.execute(
@@ -746,8 +878,28 @@ def equipment_page():
 @app.post("/equipment/<int:eid>/delete")
 def delete_equipment(eid):
     conn = get_db()
-    conn.execute("DELETE FROM equipment WHERE id=?", (eid,))
-    conn.commit()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError:
+        flash("系统正忙，请稍后重试删除器具", "error")
+        return redirect(url_for("equipment_page"))
+    try:
+        row = conn.execute("SELECT * FROM equipment WHERE id=?", (eid,)).fetchone()
+        if row is None:
+            conn.rollback()
+            flash("器具不存在或已删除", "error")
+            return redirect(url_for("equipment_page"))
+        before = inprogress_guard_snapshot(conn)
+        conn.execute("DELETE FROM equipment WHERE id=?", (eid,))
+        violated = inprogress_violations(conn, before)
+        if violated:
+            conn.rollback()
+            flash(guard_reject_text(violated, prefix="未删除"), "error")
+            return redirect(url_for("equipment_page"))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     flash("器具已删除（其清洁记录与批次关联一并移除）", "ok")
     return redirect(url_for("equipment_page"))
 
@@ -762,17 +914,32 @@ def add_cleaning():
     cover_all = request.form.get("cover_all")
     if not (equipment_id and cleaned_at and valid_until):
         flash("请完整填写清洁记录（器具、清洁时间、有效至）", "error")
-    else:
-        covers_str = "*" if cover_all else ",".join(covers)
-        if not covers_str:
-            flash("请选择清洁覆盖的过敏原，或勾选“全部过敏原”", "error")
-        else:
-            conn.execute(
-                "INSERT INTO cleaning(equipment_id, cleaned_at, valid_until, covers)"
-                " VALUES (?,?,?,?)",
-                (equipment_id, cleaned_at, valid_until, covers_str))
-            conn.commit()
-            flash("清洁记录已登记", "ok")
+        return redirect(url_for("equipment_page"))
+    covers_str = "*" if cover_all else ",".join(covers)
+    if not covers_str:
+        flash("请选择清洁覆盖的过敏原，或勾选“全部过敏原”", "error")
+        return redirect(url_for("equipment_page"))
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError:
+        flash("系统正忙，请稍后重试登记清洁", "error")
+        return redirect(url_for("equipment_page"))
+    try:
+        before = inprogress_guard_snapshot(conn)
+        conn.execute(
+            "INSERT INTO cleaning(equipment_id, cleaned_at, valid_until, covers)"
+            " VALUES (?,?,?,?)",
+            (equipment_id, cleaned_at, valid_until, covers_str))
+        violated = inprogress_violations(conn, before)
+        if violated:
+            conn.rollback()
+            flash(guard_reject_text(violated, prefix="未登记清洁"), "error")
+            return redirect(url_for("equipment_page"))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    flash("清洁记录已登记", "ok")
     return redirect(url_for("equipment_page"))
 
 
@@ -788,25 +955,33 @@ def delete_cleaning(cid):
     """
     conn = get_db()
     if request.method == "POST":
-        cleaning = conn.execute(
-            "SELECT c.*, e.name AS equipment_name FROM cleaning c"
-            " JOIN equipment e ON e.id = c.equipment_id WHERE c.id=?",
-            (cid,)).fetchone()
         reason = request.form.get("reason", "").strip()
-        if cleaning is None:
-            flash("清洁记录不存在或已被删除，未改动任何数据", "error")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError:
+            flash("系统正忙，请稍后重试删除清洁记录", "error")
             return redirect(url_for("equipment_page"))
-        if not reason:
-            # 拒绝操作：保留原数据，回到确认页并附原因必填提示
-            cleaning_preview, affected = affected_of_cleaning(conn, cid)
-            flash("未删除：请填写删除原因并确认", "error")
-            return render_template(
-                "cleaning_delete.html", cleaning=cleaning_preview,
-                affected=affected, reason_value=reason), 400
-        # 确认前再按当前排程计算一次受影响批次并保存快照
-        _, affected = affected_of_cleaning(conn, cid)
-        deleted_at = datetime.now().isoformat(timespec="minutes")
-        with conn:
+        try:
+            cleaning = conn.execute(
+                "SELECT c.*, e.name AS equipment_name FROM cleaning c"
+                " JOIN equipment e ON e.id = c.equipment_id WHERE c.id=?",
+                (cid,)).fetchone()
+            if cleaning is None:
+                conn.rollback()
+                flash("清洁记录不存在或已被删除，未改动任何数据", "error")
+                return redirect(url_for("equipment_page"))
+            if not reason:
+                conn.rollback()
+                # 拒绝操作：保留原数据，回到确认页并附原因必填提示
+                cleaning_preview, affected = affected_of_cleaning(conn, cid)
+                flash("未删除：请填写删除原因并确认", "error")
+                return render_template(
+                    "cleaning_delete.html", cleaning=cleaning_preview,
+                    affected=affected, reason_value=reason), 400
+            before = inprogress_guard_snapshot(conn)
+            # 确认前再按当前排程计算一次受影响批次并保存快照
+            _, affected = affected_of_cleaning(conn, cid)
+            deleted_at = datetime.now().isoformat(timespec="minutes")
             conn.execute(
                 "INSERT INTO cleaning_deletion(cleaning_id, equipment_id,"
                 " equipment_name, cleaned_at, valid_until, covers, reason,"
@@ -816,6 +991,15 @@ def delete_cleaning(cid):
                  cleaning["valid_until"], cleaning["covers"], reason,
                  deleted_at, json.dumps(affected, ensure_ascii=False)))
             conn.execute("DELETE FROM cleaning WHERE id=?", (cid,))
+            violated = inprogress_violations(conn, before)
+            if violated:
+                conn.rollback()
+                flash(guard_reject_text(violated, prefix="未删除"), "error")
+                return redirect(url_for("equipment_page"))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         if affected:
             names = "、".join(f"「{a['batch_name']}」" for a in affected)
             flash(f"清洁记录已删除并留档；以下批次因该记录失效转为阻塞：{names}。"
@@ -846,21 +1030,37 @@ def add_downtime():
     start_str = (request.form.get("start_at", "") or "").strip()
     end_str = (request.form.get("end_at", "") or "").strip()
     reason = (request.form.get("reason", "") or "").strip()
-    equipment, start_dt, end_dt, error = validate_downtime(
-        conn, equipment_id, start_str, end_str, reason)
-    if error:
-        flash(f"未登记停用：{error}", "error")
-    else:
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError:
+        flash("系统正忙，请稍后重试登记停用", "error")
+        return redirect(url_for("equipment_page"))
+    try:
+        equipment, start_dt, end_dt, error = validate_downtime(
+            conn, equipment_id, start_str, end_str, reason)
+        if error:
+            conn.rollback()
+            flash(f"未登记停用：{error}", "error")
+            return redirect(url_for("equipment_page"))
+        before = inprogress_guard_snapshot(conn)
         conn.execute(
             "INSERT INTO equipment_downtime(equipment_id, start_at, end_at,"
             " reason, created_at) VALUES (?,?,?,?,?)",
             (equipment["id"], start_dt.isoformat(timespec="minutes"),
              end_dt.isoformat(timespec="minutes"), reason,
              datetime.now().isoformat(timespec="minutes")))
+        violated = inprogress_violations(conn, before)
+        if violated:
+            conn.rollback()
+            flash(guard_reject_text(violated, prefix="未登记停用"), "error")
+            return redirect(url_for("equipment_page"))
         conn.commit()
-        flash(f"器具「{equipment['name']}」停用检修时段已登记"
-              f"（{fmt_dt_min(start_dt)} ~ {fmt_dt_min(end_dt)}），"
-              f"排程已按最新停用状态计算", "ok")
+    except Exception:
+        conn.rollback()
+        raise
+    flash(f"器具「{equipment['name']}」停用检修时段已登记"
+          f"（{fmt_dt_min(start_dt)} ~ {fmt_dt_min(end_dt)}），"
+          f"排程已按最新停用状态计算", "ok")
     return redirect(url_for("equipment_page"))
 
 
@@ -868,30 +1068,48 @@ def add_downtime():
 def edit_downtime(did):
     """修改停用记录的器具、起止时间与原因；已取消的记录拒绝变更。"""
     conn = get_db()
-    row = conn.execute("SELECT * FROM equipment_downtime WHERE id=?",
-                       (did,)).fetchone()
-    if row is None:
-        flash("停用记录不存在或已删除，未改动任何数据", "error")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError:
+        flash("系统正忙，请稍后重试修改停用记录", "error")
         return redirect(url_for("equipment_page"))
-    if row["cancelled_at"] is not None:
-        flash("停用记录已取消，不能再修改；请重新登记停用时段", "error")
-        return redirect(url_for("equipment_page"))
-    equipment_id = request.form.get("equipment_id", "")
-    start_str = (request.form.get("start_at", "") or "").strip()
-    end_str = (request.form.get("end_at", "") or "").strip()
-    reason = (request.form.get("reason", "") or "").strip()
-    equipment, start_dt, end_dt, error = validate_downtime(
-        conn, equipment_id, start_str, end_str, reason, exclude_id=did)
-    if error:
-        flash(f"未保存修改：{error}", "error")
-    else:
+    try:
+        row = conn.execute("SELECT * FROM equipment_downtime WHERE id=?",
+                           (did,)).fetchone()
+        if row is None:
+            conn.rollback()
+            flash("停用记录不存在或已删除，未改动任何数据", "error")
+            return redirect(url_for("equipment_page"))
+        if row["cancelled_at"] is not None:
+            conn.rollback()
+            flash("停用记录已取消，不能再修改；请重新登记停用时段", "error")
+            return redirect(url_for("equipment_page"))
+        equipment_id = request.form.get("equipment_id", "")
+        start_str = (request.form.get("start_at", "") or "").strip()
+        end_str = (request.form.get("end_at", "") or "").strip()
+        reason = (request.form.get("reason", "") or "").strip()
+        equipment, start_dt, end_dt, error = validate_downtime(
+            conn, equipment_id, start_str, end_str, reason, exclude_id=did)
+        if error:
+            conn.rollback()
+            flash(f"未保存修改：{error}", "error")
+            return redirect(url_for("equipment_page"))
+        before = inprogress_guard_snapshot(conn)
         conn.execute(
             "UPDATE equipment_downtime SET equipment_id=?, start_at=?,"
             " end_at=?, reason=? WHERE id=?",
             (equipment["id"], start_dt.isoformat(timespec="minutes"),
              end_dt.isoformat(timespec="minutes"), reason, did))
+        violated = inprogress_violations(conn, before)
+        if violated:
+            conn.rollback()
+            flash(guard_reject_text(violated, prefix="未保存修改"), "error")
+            return redirect(url_for("equipment_page"))
         conn.commit()
-        flash(f"停用记录 #{did} 已更新，排程已按最新停用状态计算", "ok")
+    except Exception:
+        conn.rollback()
+        raise
+    flash(f"停用记录 #{did} 已更新，排程已按最新停用状态计算", "ok")
     return redirect(url_for("equipment_page"))
 
 
@@ -902,18 +1120,36 @@ def cancel_downtime(did):
     记录不存在或已取消时拒绝变更；取消操作不改动停用原因与历史登记内容。
     """
     conn = get_db()
-    row = conn.execute("SELECT * FROM equipment_downtime WHERE id=?",
-                       (did,)).fetchone()
-    if row is None:
-        flash("停用记录不存在或已删除，未改动任何数据", "error")
-    elif row["cancelled_at"] is not None:
-        flash("该停用记录此前已取消，无需重复取消", "error")
-    else:
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError:
+        flash("系统正忙，请稍后重试取消停用", "error")
+        return redirect(url_for("equipment_page"))
+    try:
+        row = conn.execute("SELECT * FROM equipment_downtime WHERE id=?",
+                           (did,)).fetchone()
+        if row is None:
+            conn.rollback()
+            flash("停用记录不存在或已删除，未改动任何数据", "error")
+            return redirect(url_for("equipment_page"))
+        if row["cancelled_at"] is not None:
+            conn.rollback()
+            flash("该停用记录此前已取消，无需重复取消", "error")
+            return redirect(url_for("equipment_page"))
+        before = inprogress_guard_snapshot(conn)
         conn.execute(
             "UPDATE equipment_downtime SET cancelled_at=? WHERE id=?",
             (datetime.now().isoformat(timespec="minutes"), did))
+        violated = inprogress_violations(conn, before)
+        if violated:
+            conn.rollback()
+            flash(guard_reject_text(violated, prefix="未取消停用"), "error")
+            return redirect(url_for("equipment_page"))
         conn.commit()
-        flash(f"停用记录 #{did} 已取消，该时段不再阻塞排程", "ok")
+    except Exception:
+        conn.rollback()
+        raise
+    flash(f"停用记录 #{did} 已取消，该时段不再阻塞排程", "ok")
     return redirect(url_for("equipment_page"))
 
 
@@ -1126,7 +1362,8 @@ def reschedule_confirm():
     先比对排程依据指纹：试算后批次、器具、清洁、停用或配方任一变化，
     方案即过期，拒绝保存并提示重新试算；指纹一致则重新校验方案后在
     BEGIN IMMEDIATE 事务内更新批次时段/器具关联与全部批次顺序——
-    任何失败都回滚，不会部分写入。含阻塞批次的方案允许保存，
+    任何失败都回滚，不会部分写入。若调整会改变进行中（已开工未完工）
+    批次的排程依据计算结果，整次拒绝并指出批次。含阻塞批次的方案允许保存，
     交接版发布仍按原规则要求全部批次可排入。
     """
     conn = get_db()
@@ -1141,6 +1378,7 @@ def reschedule_confirm():
         flash("系统正忙，请稍后重试确认保存", "error")
         return redirect(url_for("reschedule_page"))
     try:
+        before = inprogress_guard_snapshot(conn)
         if not basis or basis != schedule_basis_fingerprint(conn):
             conn.rollback()
             flash("未保存：试算后排程依据（批次、器具、清洁、停用或配方）"
@@ -1164,6 +1402,11 @@ def reschedule_confirm():
                     " VALUES (?,?)", (bid, eid))
         for i, bid in enumerate(order_ids, 1):
             conn.execute("UPDATE batch SET seq=? WHERE id=?", (i, bid))
+        violated = inprogress_violations(conn, before)
+        if violated:
+            conn.rollback()
+            flash(guard_reject_text(violated, prefix="未保存"), "error")
+            return redirect(url_for("reschedule_page"))
         conn.commit()
     except Exception:
         conn.rollback()
@@ -1872,8 +2115,11 @@ def release_detail(version):
     if rel is None:
         flash(f"交接版 v{version} 不存在", "error")
         return redirect(url_for("releases"))
+    executions = {e["batch_id"]: dict(e) for e in conn.execute(
+        "SELECT * FROM execution WHERE release_id=?", (rel["id"],))}
     return render_template("release_detail.html", rel=rel,
-                           items=release_items(conn, rel["id"]))
+                           items=release_items(conn, rel["id"]),
+                           executions=executions)
 
 
 def release_export_rows(items):
@@ -1963,6 +2209,255 @@ def release_export_json(version):
                     mimetype="application/json; charset=utf-8",
                     headers={"Content-Disposition":
                              f"attachment; filename=handover_v{version}.json"})
+
+
+# ---------------------------------------------------------------- 生产执行
+
+def execution_by_batch(conn):
+    """全部执行记录按批次索引：{batch_id: 记录}（每批次至多一条，唯一约束保证）。"""
+    return {r["batch_id"]: dict(r)
+            for r in conn.execute("SELECT * FROM execution")}
+
+
+def live_basis_map(conn):
+    """实时排程中每个批次当前的开工依据：顺序、排程状态、计划时段、器具、
+    过敏原、风险来源与所用清洁（与开工校验、交接版快照用同一套字段）。"""
+    basis = {}
+    for i, r in enumerate(compute_schedule(conn), 1):
+        basis[r["id"]] = (
+            i, r["status"],
+            r["start"].isoformat(timespec="minutes") if r["start"] else "",
+            r["end"].isoformat(timespec="minutes") if r["end"] else "",
+            "、".join(r["equipment_names"]),
+            "、".join(r["allergens"]),
+            tuple(risk_fingerprint(r["risks"])),
+        )
+    return basis
+
+
+def inprogress_guard_snapshot(conn):
+    """进行中（已开工未完工）批次当前的排程依据：{batch_id: basis | None}。
+
+    写操作在事务内先取本快照、写入后再取一次对比：任何使进行中批次计算
+    结果发生变化的批次 / 器具 / 清洁 / 停用 / 批量调整操作都会被整次拒绝；
+    None 表示批次已不在实时排程中（如被删除），同样视为依据被改变。
+    """
+    live = live_basis_map(conn)
+    return {ex["batch_id"]: live.get(ex["batch_id"])
+            for ex in conn.execute(
+                "SELECT batch_id FROM execution WHERE actual_end IS NULL")}
+
+
+def inprogress_violations(conn, before):
+    """对比操作前快照与当前状态，返回排程依据被改变的进行中批次 [(id, 名称)]。"""
+    if not before:
+        return []
+    after = inprogress_guard_snapshot(conn)
+    names = {r["batch_id"]: r["batch_name"] for r in conn.execute(
+        "SELECT batch_id, batch_name FROM execution")}
+    return [(bid, names.get(bid, f"#{bid}"))
+            for bid, old in before.items() if after.get(bid) != old]
+
+
+def guard_reject_text(violated, prefix="未保存"):
+    """进行中批次排程依据被改变时的整次拒绝说明（指出具体批次）。"""
+    names = "、".join(f"「{name}」#{bid}" for bid, name in violated)
+    return (f"{prefix}：操作会改变进行中批次 {names} 的排程依据"
+            f"（顺序 / 计划时段 / 器具 / 过敏原 / 风险来源与所用清洁），"
+            f"进行中批次的排程依据必须保持不变，已整次拒绝，未改动任何数据")
+
+
+def start_drift_changes(result, position, item):
+    """把某批次的实时排程结果与交接版快照逐项对比（开工校验与页面提示）。
+
+    result 为 None 表示批次已删除。返回差异说明列表，空列表表示一致、可开工。
+    """
+    if result is None:
+        return ["批次已删除，不在当前批次列表中"]
+    changes = []
+    if result["status"] != "accepted":
+        reason = "；".join(result["blocks"]) if result["blocks"] else "未能排入"
+        changes.append(f"实时排程状态：已排入 → 已拒绝（{reason}）")
+    if position != item["position"]:
+        changes.append(f"顺序：交接版第 {item['position']} 位 → 当前第 {position} 位")
+    cur_start = result["start"].isoformat(timespec="minutes") \
+        if result["start"] else ""
+    cur_end = result["end"].isoformat(timespec="minutes") if result["end"] else ""
+    if cur_start != (item["planned_start"] or "") \
+            or cur_end != (item["planned_end"] or ""):
+        fmt = lambda s: (s or "").replace("T", " ") or "—"  # noqa: E731
+        changes.append(f"计划时段：{fmt(item['planned_start'])} ~ "
+                       f"{fmt(item['planned_end'])} → {fmt(cur_start)} ~ {fmt(cur_end)}")
+    cur_eq = "、".join(result["equipment_names"])
+    if cur_eq != (item["equipment_names"] or ""):
+        changes.append(f"器具：{item['equipment_names'] or '—'} → {cur_eq or '—'}")
+    cur_alg = "、".join(result["allergens"])
+    if cur_alg != (item["allergens"] or ""):
+        changes.append(f"过敏原：{item['allergens'] or '无'} → {cur_alg or '无'}")
+    if risk_fingerprint(result["risks"]) != risk_fingerprint(item["risks"]):
+        changes.append("风险来源 / 所用清洁与交接版快照不一致")
+    return changes
+
+
+@app.route("/execution")
+def execution_page():
+    """生产执行页：按最新交接版逐批开工 / 完工，并列出全部执行记录。"""
+    conn = get_db()
+    latest = latest_release(conn)
+    items = release_items(conn, latest["id"]) if latest else []
+    executions = execution_by_batch(conn)
+    live = compute_schedule(conn)
+    pos = {r["id"]: i for i, r in enumerate(live, 1)}
+    by_id = {r["id"]: r for r in live}
+    rows = []
+    for it in items:
+        ex = executions.get(it["batch_id"])
+        changes = start_drift_changes(by_id.get(it["batch_id"]),
+                                      pos.get(it["batch_id"]), it)
+        rows.append({"item": it, "execution": ex, "changes": changes,
+                     "startable": ex is None and not changes})
+    history = [dict(r) for r in conn.execute(
+        "SELECT * FROM execution ORDER BY id DESC")]
+    current = {r["id"]: r for r in conn.execute("SELECT * FROM batch")}
+    for e in history:
+        cur = current.get(e["batch_id"])
+        e["batch_gone"] = cur is None
+        e["rescheduled"] = bool(cur) and (
+            parse_dt(cur["planned_start"]) != parse_dt(e["planned_start"])
+            or parse_dt(cur["planned_end"]) != parse_dt(e["planned_end"]))
+    return render_template("execution.html", latest=latest, rows=rows,
+                           history=history)
+
+
+@app.post("/execution/start/<int:bid>")
+def start_execution(bid):
+    """登记开工：仅当批次仍在最新交接版中、批次仍存在、实时排程已排入，
+    且顺序 / 计划时段 / 器具 / 过敏原 / 风险来源与所用清洁均与该版快照一致时
+    才记录实际开工时间；否则说明差异且不记开工。同一批次不得重复开工。
+
+    判定与写入在同一 BEGIN IMMEDIATE 事务内完成（写锁保护），并发开工或并发
+    修改排程依据只能排在事务之前或之后；execution.batch_id 的唯一约束兜底，
+    避免并发穿透造成重复开工或依据不一致。
+    """
+    conn = get_db()
+    actual_start = (request.form.get("actual_start", "") or "").strip()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError:
+        flash("系统正忙，请稍后重试登记开工", "error")
+        return redirect(url_for("execution_page"))
+    try:
+        latest = latest_release(conn)
+        if latest is None:
+            conn.rollback()
+            flash("未记开工：尚未发布交接版，请先在排程看板发布交接版", "error")
+            return redirect(url_for("execution_page"))
+        item = conn.execute(
+            "SELECT * FROM release_item WHERE release_id=? AND batch_id=?",
+            (latest["id"], bid)).fetchone()
+        if item is None:
+            conn.rollback()
+            flash(f"未记开工：批次 #{bid} 不在最新交接版 v{latest['version']} 中"
+                  f"（交接版发布后新增的批次不能按该版开工）", "error")
+            return redirect(url_for("execution_page"))
+        item = dict(item)
+        try:
+            item["risks"] = json.loads(item.get("risks") or "[]")
+        except (TypeError, ValueError):
+            item["risks"] = []
+        start_dt = parse_dt(actual_start)
+        if start_dt is None:
+            conn.rollback()
+            flash("未记开工：请填写有效的实际开工时间", "error")
+            return redirect(url_for("execution_page"))
+        existing = conn.execute(
+            "SELECT * FROM execution WHERE batch_id=?", (bid,)).fetchone()
+        if existing is not None:
+            conn.rollback()
+            flash(f"未记开工：批次「{existing['batch_name']}」已登记开工"
+                  f"（交接版 v{existing['version']}，实际开工 "
+                  f"{fmt_dt_min(existing['actual_start'])}），"
+                  f"同一批次不得重复开工", "error")
+            return redirect(url_for("execution_page"))
+        live = compute_schedule(conn)
+        pos = {r["id"]: i for i, r in enumerate(live, 1)}
+        by_id = {r["id"]: r for r in live}
+        changes = start_drift_changes(by_id.get(bid), pos.get(bid), item)
+        if changes:
+            conn.rollback()
+            flash(f"未记开工：批次「{item['batch_name']}」与交接版 "
+                  f"v{latest['version']} 快照不一致——" + "；".join(changes)
+                  + "。请先使实时排程与交接版一致（或重新发布交接版）后再开工",
+                  "error")
+            return redirect(url_for("execution_page"))
+        conn.execute(
+            "INSERT INTO execution(release_id, version, batch_id, batch_name,"
+            " position, allergens, equipment_names, planned_start, planned_end,"
+            " actual_start, started_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (latest["id"], latest["version"], bid, item["batch_name"],
+             item["position"], item["allergens"], item["equipment_names"],
+             item["planned_start"], item["planned_end"],
+             start_dt.isoformat(timespec="minutes"),
+             datetime.now().isoformat(timespec="minutes")))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        flash("未记开工：该批次已存在执行记录，同一批次不得重复开工", "error")
+        return redirect(url_for("execution_page"))
+    except Exception:
+        conn.rollback()
+        raise
+    flash(f"批次「{item['batch_name']}」已按交接版 v{latest['version']} 登记开工"
+          f"（实际开工 {fmt_dt_min(actual_start)}），执行记录已保存", "ok")
+    return redirect(url_for("execution_page"))
+
+
+@app.post("/execution/<int:exid>/finish")
+def finish_execution(exid):
+    """登记完工：仅进行中（已开工未完工）批次可登记；完工时间早于开工时间
+    或重复完工均拒绝。判定与更新在同一事务内完成，避免并发穿透。"""
+    conn = get_db()
+    actual_end = (request.form.get("actual_end", "") or "").strip()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError:
+        flash("系统正忙，请稍后重试登记完工", "error")
+        return redirect(url_for("execution_page"))
+    try:
+        ex = conn.execute("SELECT * FROM execution WHERE id=?",
+                          (exid,)).fetchone()
+        if ex is None:
+            conn.rollback()
+            flash("未记完工：执行记录不存在", "error")
+            return redirect(url_for("execution_page"))
+        if ex["actual_end"]:
+            conn.rollback()
+            flash(f"未记完工：批次「{ex['batch_name']}」已于 "
+                  f"{fmt_dt_min(ex['actual_end'])} 登记完工，不得重复完工", "error")
+            return redirect(url_for("execution_page"))
+        end_dt = parse_dt(actual_end)
+        if end_dt is None:
+            conn.rollback()
+            flash("未记完工：请填写有效的实际完工时间", "error")
+            return redirect(url_for("execution_page"))
+        start_dt = parse_dt(ex["actual_start"])
+        if start_dt is not None and end_dt < start_dt:
+            conn.rollback()
+            flash(f"未记完工：完工时间 {fmt_dt_min(actual_end)} 早于开工时间 "
+                  f"{fmt_dt_min(ex['actual_start'])}，请核对后再填写", "error")
+            return redirect(url_for("execution_page"))
+        conn.execute(
+            "UPDATE execution SET actual_end=?, finished_at=? WHERE id=?",
+            (end_dt.isoformat(timespec="minutes"),
+             datetime.now().isoformat(timespec="minutes"), exid))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    flash(f"批次「{ex['batch_name']}」已登记完工"
+          f"（{fmt_dt_min(ex['actual_start'])} ~ {fmt_dt_min(actual_end)}），"
+          f"执行记录已保存", "ok")
+    return redirect(url_for("execution_page"))
 
 
 # ---------------------------------------------------------------- 启动

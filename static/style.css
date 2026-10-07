@@ -216,3 +216,9 @@ tr.cancelled-row td > * { opacity: .8; }
 .remedy-table tr.bad-row td { background: var(--bad-bg); }
 .remedy-window { margin-top: 6px; font-size: 13.5px; color: var(--ok); }
 tr.target-row td { outline: 2px solid var(--warn); outline-offset: -2px; }
+
+/* 生产执行 */
+.exec-form { display: flex; flex-direction: column; gap: 6px; min-width: 190px; }
+.exec-form input[type="datetime-local"] {
+  padding: 5px 6px; border: 1px solid var(--line); border-radius: 6px; font-size: 13px;
+}

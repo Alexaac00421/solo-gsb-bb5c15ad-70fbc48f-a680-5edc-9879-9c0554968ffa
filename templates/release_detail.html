@@ -17,7 +17,7 @@
   <table>
     <thead>
       <tr><th>#</th><th>批次 / 过敏原</th><th>器具</th><th>预计时段</th>
-        <th>状态</th><th>风险来源与所用清洁</th></tr>
+        <th>状态</th><th>风险来源与所用清洁</th><th>执行</th></tr>
     </thead>
     <tbody>
     {% for it in items %}
@@ -56,6 +56,18 @@
           {% endif %}
           {% if it.revision_note %}
           <div class="revision-note">📝 {{ it.revision_note }}</div>
+          {% endif %}
+        </td>
+        <td class="release-diff">
+          {% set ex = executions.get(it.batch_id) %}
+          {% if ex is none %}
+          <span class="badge muted">未开工</span>
+          {% elif ex.actual_end %}
+          <span class="badge ok">已完工</span><br>
+          <span class="muted time">{{ ex.actual_start.replace('T', ' ') }} ~ {{ ex.actual_end.replace('T', ' ') }}</span>
+          {% else %}
+          <span class="badge warn">进行中</span><br>
+          <span class="muted time">开工 {{ ex.actual_start.replace('T', ' ') }}</span>
           {% endif %}
         </td>
       </tr>

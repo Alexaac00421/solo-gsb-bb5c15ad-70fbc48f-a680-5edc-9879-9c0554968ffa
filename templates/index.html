@@ -15,6 +15,7 @@
         onsubmit="return confirm('将按当前器具占用、过敏原、清洁规则与器具停用状态重新计算；存在阻塞批次（含与有效停用时段相交）时不会生成版本。确认发布交接版？');">
     <button class="btn" type="submit">📦 发布交接版</button>
   </form>
+  <a class="btn ghost" href="{{ url_for('execution_page') }}">🧑‍🍳 生产执行</a>
   <a class="btn ghost" href="{{ url_for('reschedule_page') }}">🧪 批量调整试算</a>
   <a class="btn ghost" href="{{ url_for('cleaning_remedy_page') }}">🧯 清洁补救试算</a>
   <a class="btn ghost" href="{{ url_for('export_csv') }}">⬇ 导出 CSV</a>
@@ -157,10 +158,15 @@
     <a href="{{ url_for('release_export_json', version=latest_release.version) }}">导出 JSON</a> ·
     <a href="{{ url_for('releases') }}">全部版本</a>
   </p>
+  {% if exec_stats %}
+  <p class="hint">执行进度：已完工 {{ exec_stats.done }} · 进行中 {{ exec_stats.doing }} ·
+    未开工 {{ exec_stats.todo }} — 前往 <a href="{{ url_for('execution_page') }}">生产执行</a>
+    按本版逐批登记开工 / 完工。</p>
+  {% endif %}
   <table>
     <thead>
       <tr><th>#</th><th>批次 / 过敏原</th><th>器具</th><th>预计时段</th>
-        <th>状态</th><th>风险来源与所用清洁</th><th>对比当前排程</th></tr>
+        <th>状态</th><th>风险来源与所用清洁</th><th>对比当前排程</th><th>执行</th></tr>
     </thead>
     <tbody>
     {% for it in release_items %}
@@ -217,6 +223,16 @@
             {% else %}
             <span class="muted">—</span>
             {% endif %}
+          {% endif %}
+        </td>
+        <td class="release-diff">
+          {% set ex = executions.get(it.batch_id) %}
+          {% if ex is none %}
+          <span class="badge muted">未开工</span>
+          {% elif ex.actual_end %}
+          <span class="badge ok">已完工</span>
+          {% else %}
+          <span class="badge warn">进行中</span>
           {% endif %}
         </td>
       </tr>

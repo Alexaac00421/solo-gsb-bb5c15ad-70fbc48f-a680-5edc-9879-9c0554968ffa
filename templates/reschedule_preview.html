@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% block title %}试算结果 · 批量调整 · 共享厨房过敏原排程{% endblock %}
+{% block content %}
+<section class="cards">
+  <div class="card ok"><div class="num">{{ trial_accepted }}</div><div>试算后排入批次</div></div>
+  <div class="card bad"><div class="num">{{ trial_blocked }}</div><div>试算后阻塞批次</div></div>
+  <div class="card"><div class="num">{{ rows|length }}</div><div>批次总数</div></div>
+</section>
+
+<section class="panel">
+  <h2>试算结果（尚未保存）</h2>
+  <p class="hint">以下为按调整方案试算的完整排程，<b>尚未写入</b>：实时排程、导出与交接版均未变化。
+    点击「确认保存全部调整」后才会在同一事务内一次性保存；若确认时批次、器具、清洁、停用或配方
+    等排程依据已发生变化，方案将被判定过期并拒绝，需要重新试算。</p>
+  <table class="schedule">
+    <thead>
+      <tr>
+        <th>新顺序</th><th>批次 / 过敏原</th><th>调整前（实时排程）</th>
+        <th>试算后</th><th>变化</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for row in rows %}
+      {% set b = row.before %}
+      {% set t = row.after %}
+      <tr class="{{ t.status }}">
+        <td>{{ loop.index }}</td>
+        <td>
+          <strong>{{ t.name }}</strong> <span class="muted">#{{ t.id }}</span><br>
+          <span class="tags">
+            {% for a in t.allergens %}<span class="tag">{{ a }}</span>
+            {% else %}<span class="tag none">无过敏原</span>{% endfor %}
+          </span><br>
+          {% if row.adjusted %}<span class="badge add">本次调整</span>
+          {% else %}<span class="badge muted">未改动</span>{% endif %}
+        </td>
+        <td>
+          <div class="time">
+            {% if b.start %}{{ b.start.strftime('%m-%d %H:%M') }} ~ {{ b.end.strftime('%H:%M') }}{% else %}—{% endif %}
+          </div>
+          <div>{{ b.equipment_names|join('、') if b.equipment_names else '—' }}</div>
+          {% if b.status == 'accepted' %}<span class="badge ok">已排入</span>
+          {% else %}<span class="badge bad">已拒绝</span>{% endif %}
+          {% if b.blocks %}
+          <ul class="reasons">
+            {% for reason in b.blocks %}<li class="block">⛔ {{ reason }}</li>{% endfor %}
+          </ul>
+          {% endif %}
+        </td>
+        <td class="risks">
+          <div class="time">
+            {% if t.start %}{{ t.start.strftime('%m-%d %H:%M') }} ~ {{ t.end.strftime('%H:%M') }}{% else %}—{% endif %}
+          </div>
+          <div>{{ t.equipment_names|join('、') if t.equipment_names else '—' }}</div>
+          {% if t.status == 'accepted' %}<span class="badge ok">已排入</span>
+          {% else %}<span class="badge bad">已拒绝</span>{% endif %}
+          {% if t.status == 'blocked' %}
+          <ul class="reasons">
+            {% for reason in t.blocks %}<li class="block">⛔ {{ reason }}</li>{% endfor %}
+          </ul>
+          {% endif %}
+          {% set shown = t.risks|selectattr('level', 'ne', 'blocked')|list if t.status == 'blocked' else t.risks %}
+          {% if shown %}
+          <ul class="reasons">
+            {% for risk in shown %}
+            <li class="{{ risk.level }}">
+              {{ risk_source_text(risk) }}<br>
+              <span class="action">
+                {% if risk.level == 'none' %}✅{% elif risk.level == 'mitigated' %}🧼{% else %}⚠️{% endif %}
+                {{ risk_action_text(risk) }}
+              </span>
+            </li>
+            {% endfor %}
+          </ul>
+          {% elif t.status == 'accepted' %}
+          <span class="muted">无前置残留风险（首用器具或器具空闲）</span>
+          {% endif %}
+        </td>
+        <td>
+          {% if row.changes %}
+          <ul class="change-list">
+            {% for c in row.changes %}<li>{{ c }}</li>{% endfor %}
+          </ul>
+          {% else %}<span class="muted">无变化</span>{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <form method="post" action="{{ url_for('reschedule_confirm') }}" class="confirm-plan"
+        onsubmit="return confirm('将一次性保存全部调整（时段、器具与目标顺序），实时排程随之更新；含阻塞批次的方案也会照常保存。确认保存？');">
+    <input type="hidden" name="basis" value="{{ basis }}">
+    <input type="hidden" name="order" value="{{ order_str }}">
+    {% for bid, adj in adjustments.items() %}
+    <input type="hidden" name="adjust" value="{{ bid }}">
+    <input type="hidden" name="start_{{ bid }}" value="{{ adj.start }}">
+    <input type="hidden" name="end_{{ bid }}" value="{{ adj.end }}">
+    {% for eid in adj.equipment %}
+    <input type="hidden" name="eq_{{ bid }}" value="{{ eid }}">
+    {% endfor %}
+    {% endfor %}
+    <div class="form-actions" style="margin-top:14px;">
+      <button class="btn" type="submit">✔ 确认保存全部调整</button>
+      <a class="btn ghost" href="{{ url_for('reschedule_page') }}">↩ 放弃并重新填写</a>
+      <a class="btn ghost" href="{{ url_for('index') }}">返回看板（不保存）</a>
+    </div>
+  </form>
+</section>
+{% endblock %}

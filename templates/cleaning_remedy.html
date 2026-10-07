@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% block title %}清洁补救试算 · 共享厨房过敏原排程{% endblock %}
+{% block content %}
+<section class="panel">
+  <h2>清洁补救试算（补一条清洁能否解除阻塞）</h2>
+  <p class="hint">针对当前排程中因<b>清洁缺失、失效或覆盖不足</b>而受阻的批次，选择目标批次并输入
+    清洁所需的<b>正整数分钟数</b>，系统按现有排入顺序、器具占用与停用时段，逐台找出
+    “前一已排入批次结束 → 目标开始”之间可连续执行清洁的<b>最晚时窗</b>；建议的单条清洁
+    覆盖该器具全部新增残留过敏原，完成时间作为清洁时间，有效期至少覆盖目标开始。
+    随后用这些<b>虚拟清洁</b>重算完整排程，展示目标及其他批次的状态 / 原因变化。
+    <b>试算不写入清洁记录、实时排程或交接版</b>；任一相关器具无足够时窗，或目标还因占用、
+    停用等原因受阻时，会明确说明不可仅靠清洁解决。</p>
+
+  {% if not targets %}
+  <p class="empty">当前没有因清洁缺失 / 失效 / 覆盖不足而受阻的批次，无需补救试算。
+    被占用冲突或器具停用阻塞的批次不属于本试算范围，可到
+    <a href="{{ url_for('index') }}">排程看板</a>查看阻塞原因。</p>
+  {% else %}
+  <form method="post" action="{{ url_for('cleaning_remedy_preview') }}">
+    <div class="grid-form" style="margin-bottom:14px;">
+      <label>清洁所需时长（正整数分钟数）
+        <input type="number" name="duration" min="1" step="1" required
+               value="{{ duration_value if duration_value else '' }}"
+               placeholder="如：20" style="max-width:220px;">
+      </label>
+    </div>
+    <table class="schedule">
+      <thead>
+        <tr><th>选择</th><th>批次 / 过敏原</th><th>器具</th><th>预计时段</th>
+          <th>清洁类阻塞原因</th><th>其他阻塞原因（清洁无法解决）</th></tr>
+      </thead>
+      <tbody>
+      {% for bid, info in targets.items() %}
+        {% set r = info.row %}
+        <tr class="blocked">
+          <td>
+            <label class="check">
+              <input type="radio" name="target_id" value="{{ r.id }}" required
+                     {% if selected == r.id|string %}checked{% endif %}> 试算
+            </label>
+          </td>
+          <td>
+            <strong>{{ r.name }}</strong> <span class="muted">#{{ r.id }}</span><br>
+            <span class="tags">
+              {% for a in r.allergens %}<span class="tag">{{ a }}</span>
+              {% else %}<span class="tag none">无过敏原</span>{% endfor %}
+            </span>
+          </td>
+          <td>{{ r.equipment_names|join('、') if r.equipment_names else '—' }}</td>
+          <td class="time">
+            {% if r.start %}{{ r.start.strftime('%m-%d %H:%M') }} ~ {{ r.end.strftime('%H:%M') }}{% else %}—{% endif %}
+          </td>
+          <td class="risks">
+            <ul class="reasons">
+              {% for risk in info.risks %}
+              <li class="block">⛔ {{ risk.block_reason }}</li>
+              {% endfor %}
+            </ul>
+          </td>
+          <td class="risks">
+            {% set others = r.blocks|reject('in', info.risks|map(attribute='block_reason'))|list %}
+            {% if others %}
+            <ul class="reasons">
+              {% for reason in others %}<li class="block">⛔ {{ reason }}</li>{% endfor %}
+            </ul>
+            <span class="badge warn">非清洁阻塞，试算会判定不可仅靠清洁解决</span>
+            {% else %}<span class="muted">无</span>{% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <div class="form-actions" style="margin-top:14px;">
+      <button class="btn" type="submit">🧪 查看补救试算</button>
+      <a class="btn ghost" href="{{ url_for('index') }}">返回看板</a>
+    </div>
+  </form>
+  {% endif %}
+</section>
+{% endblock %}

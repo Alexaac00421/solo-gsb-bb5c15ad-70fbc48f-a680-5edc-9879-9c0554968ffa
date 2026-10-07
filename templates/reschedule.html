@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block title %}批量调整试算 · 共享厨房过敏原排程{% endblock %}
+{% block content %}
+<section class="panel">
+  <h2>批量调整试算</h2>
+  <p class="hint">一次调整多个现有批次的预计起止与所用器具，并给出包含<b>全部现有批次</b>的目标顺序；
+    提交后系统按当前器具占用、过敏原残留、清洁有效期与器具停用规则<b>试算</b>完整排程，
+    逐批展示调整前后的状态、风险或阻塞原因。<b>试算不会改动实时排程、导出与交接版</b>；
+    在试算结果页确认后才一次性保存全部调整。若试算后批次、器具、清洁、停用或配方发生变化，
+    确认时方案会被判定过期而拒绝，需要重新试算。</p>
+  {% if not batches %}
+  <p class="empty">还没有批次，请先到 <a href="{{ url_for('batches') }}">批次管理</a> 录入。</p>
+  {% else %}
+  {% set pf = prefill %}
+  {% set pf_adjust = pf.getlist('adjust') if pf else [] %}
+  <form method="post" action="{{ url_for('reschedule_preview') }}">
+    <label class="order-field">目标顺序（包含全部 {{ batches|length }} 个批次的 ID，逗号分隔；缺失或重复将被拒绝）
+      <input type="text" name="order" value="{{ order_str }}" required
+             placeholder="如：{{ order_str }}">
+    </label>
+    <p class="hint">勾选「调整」的批次使用新时段与新器具参与试算；未勾选的批次保持现有时段与器具，
+      仅按目标顺序重新排位。</p>
+    <table class="adj-table">
+      <thead>
+        <tr>
+          <th>调整</th><th>当前顺序 / 批次</th><th>当前时段</th><th>当前器具</th>
+          <th>新预计开始</th><th>新预计结束</th><th>新使用器具</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for b in batches %}
+        {% set pf_eq = pf.getlist('eq_' ~ b.id) if pf else [] %}
+        <tr>
+          <td><input type="checkbox" name="adjust" value="{{ b.id }}"
+                     {% if b.id|string in pf_adjust %}checked{% endif %}></td>
+          <td>
+            第 {{ loop.index }} 位 · <span class="muted">#{{ b.id }}</span><br>
+            <strong>{{ b.name }}</strong><br>
+            <span class="tags">
+              {% for a in b.allergens.split(',') if a.strip() %}<span class="tag">{{ a.strip() }}</span>
+              {% else %}<span class="tag none">无过敏原</span>{% endfor %}
+            </span>
+          </td>
+          <td class="time">{{ b.planned_start.replace('T', ' ') }} ~ {{ b.planned_end.replace('T', ' ') }}</td>
+          <td>{{ (equip_names_of.get(b.id) or [])|join('、') or '—' }}</td>
+          <td><input type="datetime-local" name="start_{{ b.id }}"
+                     value="{{ pf.get('start_' ~ b.id, b.planned_start) if pf else b.planned_start }}"></td>
+          <td><input type="datetime-local" name="end_{{ b.id }}"
+                     value="{{ pf.get('end_' ~ b.id, b.planned_end) if pf else b.planned_end }}"></td>
+          <td>
+            <div class="eq-checks">
+            {% for e in equipment %}
+              <label class="check"><input type="checkbox" name="eq_{{ b.id }}" value="{{ e.id }}"
+                     {% if (pf and e.id|string in pf_eq) or (not pf and e.id in (equip_of.get(b.id) or [])) %}checked{% endif %}> {{ e.name }}</label>
+            {% endfor %}
+            </div>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <div class="form-actions" style="margin-top:12px;">
+      <button class="btn" type="submit">🧪 试算调整方案</button>
+      <a class="btn ghost" href="{{ url_for('index') }}">返回看板</a>
+    </div>
+  </form>
+  {% endif %}
+</section>
+{% endblock %}
